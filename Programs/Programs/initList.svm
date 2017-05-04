@@ -1,5 +1,8 @@
 ﻿/* initialize a list of 10 elements set to -1 */
 
+//start counter with 0
+mov reg2 0
+
 #loop
 mov reg1 reg2
 add reg1 10

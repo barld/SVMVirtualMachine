@@ -5,6 +5,27 @@ open ParserUtils
 open SVM
 open Microsoft.FSharp.Text.Lexing
 
+let getLabels (p:Program) =
+    let labels = 
+        p 
+        |> List.mapi (fun line I -> line,I)
+        |> List.filter (fun (_,I) -> match I with Label(_,_) -> true |_->false)
+        // Other Instructions are already filtered
+        |> List.map (fun (line,Instruction) -> line , match Instruction with Label(name,_) -> name)
+
+    // error check for doubles
+    let rec _check l =
+        match l with
+        | [] -> ()
+        | (_,name)::tail -> 
+            if tail |> List.forall (fun (_,name2) -> name <> name2) then
+                _check tail
+            else
+                failwithf "label %s may only exists once" name
+    _check labels
+    labels
+
+
 
 type ValueType =
     | Int of int
@@ -37,23 +58,29 @@ let CreateEmptyState nAddresses =
         addresses = [0..nAddresses-1] |> List.map (fun _ -> Empty)
     }
 
-let dumpState (state:state Option) =
-    match state with
-    | None -> "no state"
-    | Some state ->
-        let concatWith c =
-            fun (l:string) (r:string) ->
-                sprintf "%s%c%s" l c r
-        let concatWithT = concatWith '\t'
-        let concatWithN = concatWith '\n'
+let pc1 (state:state) = {state with PC = state.PC+1 }
 
-        let Addresses =
-            state.addresses |> List.mapi (fun i ad -> i%10, ad) 
-            |> List.groupBy (fun (row,_) -> row)
-            |> List.map (fun (_, row) -> row |> List.map (fun (_,ad) -> ValueTypeToString ad) |> List.reduce concatWithT)
-            |> List.reduce concatWithN
+let dumpState (state:state) =
+    let concatWith c =
+        fun (l:string) (r:string) ->
+            sprintf "%s%c%s" l c r
+    let concatWithT = concatWith '\t'
+    let concatWithN = concatWith '\n'
 
-        Addresses
+    let Addresses =
+        state.addresses |> List.mapi (fun i ad -> i/10, ad) 
+        |> List.groupBy (fun (row,_) -> row)
+        |> List.map (fun (_, row) -> row |> List.map (fun (_,ad) -> ValueTypeToString ad) |> List.reduce concatWithT)
+        |> List.reduce concatWithN
+
+    "MEMORY:\n"+
+    Addresses+
+    "\n============\n"+
+    "REGISTERS:\n"+
+    sprintf "%s\t%s\t%s\t%s\t\n" (ValueTypeToString state.reg1) (ValueTypeToString state.reg2) (ValueTypeToString state.reg3) (ValueTypeToString state.reg4) +
+    "============\n"+
+    "PROGRAM COUNTER:\n"+
+    (state.PC |> string) + "\n\n"
 
 let getRegisterValue state (regName:Register) =
     match regName with
@@ -109,7 +136,7 @@ let move state (arg1: Literal) (arg2: Literal) pos =
     | Address lit ->
         let adIndex = getIntValue state lit
         {state with addresses = updateAddresses state adIndex (getValue state arg2)}
-    | Register (r, pos) -> {updateRegister state r (getValue state arg2) with PC = state.PC+1}
+    | Register (r, pos) -> updateRegister state r (getValue state arg2)
     | _ -> failwith "you can't update a constant"
 
 /// <summary>
@@ -164,22 +191,55 @@ let _cmp state (arg1:Register) (arg2:Literal) =
     | Int n1, Int n2 -> Int(if n1 < n2 then -1 else if n1 = n2 then 0 else 1)
     | Float f1, Float f2 -> Int(if f1 < f2 then -1 else if f1 = f2 then 0 else 1)
     | _ -> failwith "the only supported types for this operation are are (float*float) and (int*int)"
+
+let _jmpIf b state labels id =
+    match labels |> List.tryFind (fun (_,namelabel) -> id = namelabel) with
+    | Some(line,_) -> 
+        if b then
+            {state with PC = line}
+        else
+            pc1 state
+    | None -> failwithf "could not find a label with the name %s" id  
     
+let _jmp = _jmpIf true
+    
+let _jc state labels  id (reg:Register) =
+    let b = getRegisterValueInt state reg >= 0
+    _jmpIf b state labels id
+      
+let _jeq state labels  id (reg:Register) =
+    let b = getRegisterValueInt state reg = 0
+    _jmpIf b state labels id
 
-        
-     
-
-let executeStep (program:Program) (state:state) : state Option =
-    let instruction = program |> List.item state.PC
+let executeStep (program:Program) (labels:(int*string) list) (state:state) : (state*state) Option =
+    let instruction = 
+        if state.PC >= (program |> List.length) then
+            Nop (0,0)
+        else
+            program |> List.item state.PC
+    
     match instruction with
-    | Nop _ -> None
-    | Mov(arg1,arg2,pos) -> 
-        let state' = move state arg1 arg2 pos
-        Some {state' with PC = state.PC+1}
-    | And (arg1,arg2, pos) -> Some {(_and state arg1 arg2) with PC = state.PC+1}
-    | Or(arg1,arg2,pos) -> Some {(_or state arg1 arg2) with PC = state.PC+1}
-    | Not(reg,pos) -> Some {_not state reg with PC = state.PC+1}
-    | _ -> failwith "action not suported"
+    | Nop _ when state.PC > (program |> List.length) -> None
+    | _ ->
+    Some(state, 
+        match instruction with
+        | Nop _ -> state |> pc1 //include the last frame
+        | Mov(arg1,arg2,pos) -> move state arg1 arg2 pos |> pc1
+        | And (arg1,arg2, pos) -> (_and state arg1 arg2) |> pc1
+        | Or(arg1,arg2,pos) -> _or state arg1 arg2 |> pc1
+        | Not(reg,pos) -> _not state reg |> pc1
+        | Mod(arg1,arg2, pos) -> _mod state arg1 arg2 |> pc1
+        | Add(arg1,arg2,pos) -> _add state arg1 arg2 |> pc1
+        | Sub(arg1,arg2,pos) -> _sub state arg1 arg2 |> pc1
+        | Mul(arg1,arg2,pos) -> _mul state arg1 arg2 |> pc1
+        | Div(arg1,arg2,pos) -> _div state arg1 arg2 |> pc1
+        | Cmp(arg1,arg2,pos) -> _cmp state arg1 arg2 |> pc1
+        | Jmp(label,pos) -> _jmp state labels label
+        | Jc(label,reg,pos) -> _jc state labels label reg
+        | Jeq(label,reg,pos) -> _jeq state labels label reg
+        | Label _ -> state |> pc1
+        | _ -> failwith "action not suported" //will never be reached at the moment
+    )
 
 
 
@@ -194,8 +254,13 @@ let main argv =
   try
     if argv.Length = 2 then
       let ast = parseFile argv.[0]
-      do printfn "%A" ast
-      do printfn "%s" (dumpState (executeStep ast (CreateEmptyState 100)))
+      let labels = getLabels ast
+      let state = CreateEmptyState (int argv.[1])
+      let executeStep = executeStep ast labels
+      let steps = Seq.unfold executeStep state
+      do  printfn "%A" ast
+      do  steps |> Seq.iter (fun state -> (printfn "%s" (dumpState state)))
+      Console.Read() |> ignore
       0
     else
       do printfn "You must specify a command line argument containing the path to the program source file and the size of the memory"
@@ -207,4 +272,3 @@ let main argv =
   | :? Exception as e ->
       do printfn "%s" e.Message
       1
-  //Console.Read()
